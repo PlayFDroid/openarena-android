@@ -1,0 +1,100 @@
+name: Build, Test & Release OpenArena APK
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_BUILD_TOOLS: 35.0.0
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android NDK and Build Tools
+        run: |
+          echo "PATH=$ANDROID_NDK_LATEST_HOME:$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS:$PATH" >> $GITHUB_ENV
+          echo "ANDROID_NDK=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
+
+      - name: Print Toolchain Versions
+        run: |
+          cat $ANDROID_NDK_HOME/source.properties
+          which ndk-build
+          which zipalign
+          which apksigner
+
+      - name: Setup Android Licenses & Debug Keystore
+        working-directory: project
+        run: |
+          mkdir -p $HOME/.android
+          keytool -genkey -v -keystore $HOME/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Debug, OU=Debug, O=Debug, L=Debug, ST=Debug, C=Debug"
+          yes | sudo $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          echo "proguard.config=proguard.cfg;proguard-local.cfg" >> local.properties
+
+      - name: Configure App Settings
+        run: |
+          ./changeAppSettings.sh -a
+
+      - name: Build Native Libraries and APK
+        run: |
+          ./build.sh release
+
+      - name: Check 16 KB ELF Alignment
+        run: |
+          APK=$(find project/app/build/outputs/apk/release/ -name "*.apk" | head -n 1)
+          echo "Checking alignment for $APK"
+          ./check_elf_alignment.sh "$APK"
+
+      - name: Sign Release APK (On Tag Only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > release.jks
+          export ANDROID_KEYSTORE_FILE=$(pwd)/release.jks
+          export ANDROID_KEYSTORE_ALIAS="$KEY_ALIAS"
+          export ANDROID_KEYSTORE_PASS="$KEYSTORE_PASSWORD"
+          ./sign.sh
+          rm -f release.jks
+
+      - name: Publish to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.apk"
+          generate_release_notes: true
+
+      - name: Trigger Central F-Droid Index Rebuild
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.FDROID_DISPATCH_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository_owner }}/fdroid-repo/dispatches \
+            -d '{"event_type":"new-game-release","client_payload":{"repo":"${{ github.repository }}"}}'
